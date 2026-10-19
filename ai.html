@@ -1,0 +1,801 @@
+/**
+ * DeepSeek R1 Distill Qwen 32B on Cloudflare Workers AI.
+ * SSE streaming, Markdown frontend, per-session 2,000 ESTIMATED visible tokens.
+ * Visible quota = new user messages + final assistant answers, not internal reasoning.
+ * The model's generation limit and Cloudflare billing still include reasoning.
+ * Binding required: AI (Workers AI).
+ * Session/history is stored in browser localStorage, not an anti-abuse server quota.
+ */
+const MODEL = "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b";
+const SESSION_LIMIT = 20000;
+const MODEL_MAX_GENERATION_TOKENS = 4096; // Includes reasoning. Do not confuse with session quota.
+const SYSTEM_PROMPT = `Bạn là trợ lý AI chuyên nghiệp. Luôn trả lời bằng tiếng Việt tự nhiên và nhất quán, trừ khi người dùng yêu cầu rõ ràng ngôn ngữ khác.
+Không trộn tiếng Trung, tiếng Nhật hoặc tiếng Hàn vào văn bản tiếng Việt. Chỉ giữ thuật ngữ kỹ thuật tiếng Anh khi cần thiết.
+Trình bày bằng Markdown rõ ràng, ngắn gọn, không lặp ý, ưu tiên độ chính xác. Không hiển thị hoặc thuật lại suy luận nội bộ.`;
+
+// App-level approximation only. A Qwen tokenizer is required for exact counts.
+function estimateTokens(text = "") {
+  return Math.ceil(String(text).length / 3.5);
+}
+function countVisibleTokens(messages) {
+  return messages.reduce((sum, message) => sum + estimateTokens(message.content), 0);
+}
+function fitToBudget(text, budget) {
+  text = String(text);
+  if (budget <= 0) return { text: "", truncated: text.length > 0 };
+  if (estimateTokens(text) <= budget) return { text, truncated: false };
+  const chars = Array.from(text);
+  let lo = 0, hi = chars.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (estimateTokens(chars.slice(0, mid).join("") + "…") <= budget) lo = mid;
+    else hi = mid - 1;
+  }
+  const prefix = chars.slice(0, lo).join("");
+  const result = prefix + "…";
+  return { text: estimateTokens(result) <= budget ? result : prefix, truncated: true };
+}
+function isModelIdentityQuestion(text) {
+  const value = text.toLowerCase().trim();
+  return [
+    "mô hình bạn đang dùng là gì", "model bạn đang dùng là gì",
+    "bạn đang dùng model gì", "bạn dùng model gì",
+    "bạn là model gì", "bạn là mô hình gì",
+    "model này là gì", "mô hình này là gì"
+  ].some(pattern => value === pattern || value.includes(pattern));
+}
+function json(data, status = 200) {
+  return Response.json(data, { status, headers: { "Cache-Control": "no-store" } });
+}
+function event(type, data) {
+  return "event: " + type + "\ndata: " + JSON.stringify(data) + "\n\n";
+}
+
+// Removes <think>...</think> safely even when tags are split over SSE frames.
+function makeReasoningStripper() {
+  let buffer = "";
+  let thinking = false;
+  const OPEN = "<think>";
+  const CLOSE = "</think>";
+  function partialSuffixLength(value, marker) {
+    const lower = value.toLowerCase();
+    for (let n = Math.min(marker.length - 1, lower.length); n > 0; n--) {
+if (lower.endsWith(marker.slice(0, n))) return n;
+    }
+    return 0;
+  }
+  return {
+    push(chunk) {
+      buffer += String(chunk || "");
+      let visible = "";
+      while (buffer) {
+        if (thinking) {
+          const end = buffer.toLowerCase().indexOf(CLOSE);
+          if (end !== -1) {
+            buffer = buffer.slice(end + CLOSE.length);
+            thinking = false;
+            continue;
+          }
+          // Discard reasoning, only remember incomplete closing tag.
+          const keep = partialSuffixLength(buffer, CLOSE);
+          buffer = keep ? buffer.slice(-keep) : "";
+          break;
+        }
+        const begin = buffer.toLowerCase().indexOf(OPEN);
+        if (begin !== -1) {
+          visible += buffer.slice(0, begin);
+          buffer = buffer.slice(begin + OPEN.length);
+          thinking = true;
+          continue;
+        }
+        // Protect split opening/closing tags from being exposed to the UI.
+        const keep = Math.max(partialSuffixLength(buffer, OPEN), partialSuffixLength(buffer, CLOSE));
+        const safeLength = buffer.length - keep;
+        visible += buffer.slice(0, safeLength).replace(/<\/think>/gi, "");
+        buffer = buffer.slice(safeLength);
+        break;
+      }
+      return visible;
+    },
+    flush() {
+      if (thinking) { buffer = ""; return ""; }
+      const out = buffer.replace(/<\/think>/gi, "").replace(/<think>.*$/is, "");
+      buffer = "";
+      return out;
+    }
+  };
+}
+
+// Read SSE framing in a way that tolerates UTF-8 and event delimiters split across chunks.
+async function readCloudflareEvents(reader, handleData) {
+  const decoder = new TextDecoder();
+  let buffer = "";
+  function parseFrames() {
+    for (;;) {
+      const separator = /\r?\n\r?\n/.exec(buffer);
+      if (!separator) break;
+      const frame = buffer.slice(0, separator.index);
+      buffer = buffer.slice(separator.index + separator[0].length);
+      const data = frame.split(/\r?\n/)
+        .filter(line => line.startsWith("data:"))
+        .map(line => line.slice(5).trimStart()).join("\n");
+      if (data === "[DONE]") return false;
+      if (data) {
+        let parsed;
+        try { parsed = JSON.parse(data); } catch { continue; }
+        if (handleData(parsed) === false) return false;
+      }
+    }
+    return true;
+  }
+  for (;;) {
+    const { done, value } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+    if (!parseFrames()) return;
+    if (done) {
+      // Some SSE origins end without a trailing blank line.
+      const data = buffer.split(/\r?\n/)
+        .filter(line => line.startsWith("data:"))
+        .map(line => line.slice(5).trimStart()).join("\n");
+      if (data && data !== "[DONE]") {
+        try { handleData(JSON.parse(data)); } catch {}
+      }
+      return;
+    }
+  }
+}
+function extractText(payload) {
+  // Ignore reasoning/reasoning_content channels intentionally.
+if (typeof payload?.response === "string") return payload.response;
+  if (typeof payload?.choices?.[0]?.delta?.content === "string") return payload.choices[0].delta.content;
+  if (typeof payload?.delta?.content === "string") return payload.delta.content;
+  if (typeof payload?.content === "string") return payload.content;
+  return "";
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    if (url.pathname === "/api/chat") {
+      if (request.method !== "POST") return json({ error: "Chỉ chấp nhận POST." }, 405);
+      let body;
+      try { body = await request.json(); }
+      catch { return json({ error: "JSON gửi lên không hợp lệ." }, 400); }
+      if (!Array.isArray(body?.messages)) return json({ error: "messages phải là một mảng." }, 400);
+      const messages = body.messages
+        .filter(m => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
+        .map(m => ({ role: m.role, content: m.content }));
+      const last = messages.at(-1);
+      if (!last || last.role !== "user" || !last.content.trim()) {
+        return json({ error: "Tin nhắn cuối phải là câu hỏi của người dùng." }, 400);
+      }
+      // Every visible message is counted exactly once. Do not trust a client-supplied quota.
+      const spentBefore = countVisibleTokens(messages.slice(0, -1));
+      const inputTokens = estimateTokens(last.content);
+      const outputBudget = SESSION_LIMIT - spentBefore - inputTokens;
+      if (outputBudget <= 0) {
+        return json({
+          error: "Câu hỏi không còn đủ chỗ cho câu trả lời trong quota 2.000 token. Hãy rút ngắn hoặc tạo phiên mới.",
+          limitReached: spentBefore >= SESSION_LIMIT,
+          usedTokens: Math.min(spentBefore, SESSION_LIMIT),
+          remainingTokens: Math.max(0, SESSION_LIMIT - spentBefore),
+          limit: SESSION_LIMIT
+        }, 429);
+      }
+      if (!isModelIdentityQuestion(last.content) && !env.AI) {
+        return json({ error: "Chưa cấu hình Workers AI binding có tên AI." }, 500);
+      }
+
+      let origin = null;
+      try {
+        if (!isModelIdentityQuestion(last.content)) {
+          origin = await env.AI.run(MODEL, {
+            messages: [{ role: "system", content: SYSTEM_PROMPT }, ...messages],
+            stream: true,
+            max_tokens: MODEL_MAX_GENERATION_TOKENS,
+            temperature: 0.6
+          });
+          if (!origin?.getReader) throw new Error("Workers AI không trả về ReadableStream SSE.");
+        }
+      } catch (error) {
+        return json({ error: error?.message || "Không thể khởi tạo Workers AI streaming." }, 502);
+      }
+
+      const encoder = new TextEncoder();
+      const outgoing = new ReadableStream({
+        async start(controller) {
+          const send = (type, data) => controller.enqueue(encoder.encode(event(type, data)));
+          let answer = "";
+          let truncated = false;
+          let reader = null;
+const cleaner = makeReasoningStripper();
+          function acceptDelta(rawDelta) {
+            const visible = cleaner.push(rawDelta);
+            if (!visible) return true;
+            const candidate = fitToBudget(answer + visible, outputBudget);
+            const newPart = candidate.text.startsWith(answer)
+              ? candidate.text.slice(answer.length)
+              : "";
+            answer = candidate.text;
+            if (newPart) send("delta", { text: newPart });
+            if (candidate.truncated) { truncated = true; return false; }
+            return true;
+          }
+          try {
+            send("status", { text: "Đang suy luận và tạo câu trả lời…" });
+            if (origin) {
+              reader = origin.getReader();
+              await readCloudflareEvents(reader, payload => acceptDelta(extractText(payload)));
+              if (truncated) await reader.cancel().catch(() => {});
+              if (!truncated) {
+                const tail = cleaner.flush();
+                if (tail) {
+                  const candidate = fitToBudget(answer + tail, outputBudget);
+                  const add = candidate.text.startsWith(answer) ? candidate.text.slice(answer.length) : "";
+                  answer = candidate.text;
+                  if (add) send("delta", { text: add });
+                  truncated = candidate.truncated;
+                }
+              }
+            } else {
+              acceptDelta("Bạn đang sử dụng DeepSeek R1 Distill Qwen 32B, được chạy thông qua Cloudflare Workers AI.");
+              const tail = cleaner.flush();
+              if (tail) {
+                const candidate = fitToBudget(answer + tail, outputBudget);
+                const add = candidate.text.startsWith(answer) ? candidate.text.slice(answer.length) : "";
+                answer = candidate.text;
+                if (add) send("delta", { text: add });
+                truncated = candidate.truncated;
+              }
+            }
+            answer = answer.trim();
+            const outputTokens = estimateTokens(answer);
+            const usedTokens = Math.min(SESSION_LIMIT, spentBefore + inputTokens + outputTokens);
+            send("done", {
+              answer,
+              inputTokens,
+              outputTokens,
+              usedTokens,
+              remainingTokens: SESSION_LIMIT - usedTokens,
+              limit: SESSION_LIMIT,
+              limitReached: usedTokens >= SESSION_LIMIT,
+              truncated,
+              warning: !answer
+                ? "Model chưa sinh ra câu trả lời cuối cùng; có thể hết giới hạn sinh token khi đang reasoning."
+                : truncated ? "Câu trả lời đã được cắt theo quota 2.000 token của phiên." : null
+            });
+          } catch (error) {
+            send("error", { error: error?.message || "Luồng trả lời bị gián đoạn." });
+            if (reader) await reader.cancel().catch(() => {});
+          } finally { controller.close(); }
+        }
+      });
+return new Response(outgoing, {
+        headers: {
+          "Content-Type": "text/event-stream; charset=utf-8",
+          "Cache-Control": "no-cache, no-transform",
+          "X-Content-Type-Options": "nosniff",
+          "X-Accel-Buffering": "no",
+          "Connection": "keep-alive"
+        }
+      });
+    }
+    return new Response(HTML, {
+      headers: {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff"
+      }
+    });
+  }
+};
+
+// HTML will be embedded at build time below.
+
+const HTML = `<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>DeepSeek Chat • Cloudflare AI</title>
+  <!-- Markdown + sanitization: both must load; otherwise the UI shows safe plain text. -->
+  <script defer src="https://cdn.jsdelivr.net/npm/marked@15.0.12/lib/marked.umd.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/dompurify@3.2.6/dist/purify.min.js"></script>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #111827; --sidebar: #0b1220; --surface: #1f2937;
+      --border: #293447; --muted: #98a5b7; --text: #f3f6fb;
+      --blue: #2563eb; --green: #22c55e;
+    }
+    * { box-sizing: border-box; }
+    html,body { margin:0; width:100%; height:100%; }
+    body { background:var(--bg); color:var(--text); font:14px/1.5 Inter,system-ui,-apple-system,Segoe UI,Arial,sans-serif; overflow:hidden; }
+    button,textarea { font:inherit; }
+    button { cursor:pointer; }
+    button:focus-visible,textarea:focus-visible { outline:2px solid #60a5fa; outline-offset:2px; }
+    button:disabled,textarea:disabled { cursor:not-allowed; opacity:.55; }
+    .app { height:100vh; height:100dvh; display:flex; }
+    .sidebar { width:238px; min-width:238px; background:var(--sidebar); border-right:1px solid var(--border); display:flex; flex-direction:column; }
+    .sidebar-head { padding:13px; border-bottom:1px solid var(--border); }
+    .new-chat { width:100%; padding:9px 12px; border:1px solid #3b4658; border-radius:9px; color:#fff; background:#172033; font-size:13px; font-weight:600; text-align:left; }
+    .new-chat:hover { background:#202b40; }
+    .sessions { padding:9px; overflow:auto; flex:1; }
+    .session-item { padding:9px; margin-bottom:4px; display:flex; align-items:center; gap:6px; border-radius:9px; cursor:pointer; }
+    .session-item:hover { background:#172033; }
+    .session-item.active { background:#1f2a3e; }
+    .session-content { flex:1; min-width:0; }
+    .session-title { font-size:13px; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+    .session-token { color:var(--muted); font-size:11px; margin-top:1px; }
+    .session-token.running { color:#86efac; }
+    .delete-session { width:25px; height:25px; border:0; border-radius:7px; color:#9ca3af; background:transparent; opacity:.55; font-size:13px; }
+.delete-session:hover { color:#f87171; background:#3b2531; opacity:1; }
+    .main { flex:1; min-width:0; display:flex; flex-direction:column; }
+    header { height:60px; min-height:60px; border-bottom:1px solid var(--border); padding:0 20px; display:flex; align-items:center; justify-content:space-between; gap:10px; }
+    .heading { display:flex; align-items:center; gap:10px; min-width:0; }
+    .title { font-size:16px; font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .sub-title { font-size:11px; color:var(--muted); }
+    .quota-header { text-align:right; white-space:nowrap; font-size:12px; color:#c3ccd9; }
+    .quota-header strong { color:#e6edf6; }
+    .progress { margin-top:4px; width:126px; height:4px; border-radius:999px; overflow:hidden; background:#354358; margin-left:auto; }
+    .progress > div { height:100%; width:0%; background:#4ade80; transition:width .2s; }
+    .progress > div.warning { background:#fbbf24; }
+    .progress > div.ended { background:#f87171; }
+    .mobile-sidebar { display:none; padding:3px 6px; border:0; background:transparent; color:#fff; font-size:19px; }
+    #chat { flex:1; width:100%; max-width:920px; margin:0 auto; padding:22px 20px; overflow-y:auto; min-height:0; }
+    .empty { min-height:100%; display:flex; justify-content:center; align-items:center; flex-direction:column; text-align:center; color:var(--muted); }
+    .empty-symbol { width:45px; height:45px; border:1px solid #3b4860; border-radius:14px; display:grid; place-items:center; color:#93c5fd; font-size:20px; margin-bottom:13px; }
+    .empty-title { color:#e5e7eb; font-size:21px; font-weight:700; margin-bottom:5px; }
+    .empty-hint { max-width:310px; font-size:13px; }
+    .message { margin-bottom:15px; line-height:1.6; white-space:pre-wrap; overflow-wrap:anywhere; font-size:13.5px; }
+    .message.user { margin-left:auto; padding:9px 13px; max-width:76%; width:fit-content; border-radius:14px 14px 4px 14px; background:var(--blue); }
+    .message.assistant { max-width:91%; padding:11px 14px; background:var(--surface); border:1px solid #27354a; border-radius:14px 14px 14px 4px; white-space:normal; }
+    .message.assistant.markdown > :first-child { margin-top:0; }
+    .message.assistant.markdown > :last-child { margin-bottom:0; }
+    .markdown h1,.markdown h2,.markdown h3,.markdown h4 { line-height:1.35; margin:13px 0 7px; font-weight:700; }
+    .markdown h1 { font-size:20px; } .markdown h2 { font-size:17px; }
+    .markdown h3 { font-size:15px; } .markdown h4 { font-size:14px; }
+    .markdown p,.markdown ul,.markdown ol,.markdown blockquote { margin:7px 0; }
+    .markdown ul,.markdown ol { padding-left:22px; } .markdown li { margin:3px 0; }
+    .markdown li > p { margin:3px 0; }
+    .markdown strong { font-weight:700; color:#f8fafc; }
+    .markdown a { color:#93c5fd; text-decoration:underline; text-underline-offset:2px; }
+    .markdown a:hover { color:#bfdbfe; }
+.markdown pre { background:#0d1525; border:1px solid #384355; border-radius:9px; padding:11px; overflow:auto; margin:9px 0; }
+    .markdown pre code { background:none; padding:0; border:0; white-space:pre; }
+    .markdown code { font:12px/1.5 ui-monospace,Consolas,monospace; padding:2px 4px; border-radius:4px; background:#0d1525; overflow-wrap:anywhere; }
+    .markdown blockquote { margin-left:0; padding:4px 11px; border-left:3px solid #64748b; color:#cbd5e1; }
+    .markdown table { border-collapse:collapse; width:max-content; min-width:100%; font-size:12px; }
+    .markdown th,.markdown td { border:1px solid #455269; text-align:left; padding:6px 9px; }
+    .markdown th { background:#172337; }
+    .markdown .table-scroll { overflow-x:auto; max-width:100%; margin:8px 0; }
+    .markdown hr { border:0; border-top:1px solid #475569; margin:12px 0; }
+    .markdown .task-list-item { list-style:none; }
+    .message.user { white-space:pre-wrap; }
+    .message.error { background:#451a1a; color:#fecaca; }
+    .notice { width:fit-content; max-width:90%; margin:15px auto; padding:9px 13px; border-radius:9px; background:#352d11; color:#fde68a; text-align:center; font-size:12px; }
+    .bottom { width:100%; max-width:920px; margin:0 auto; padding:0 20px 18px; }
+    .quota-details { display:flex; flex-wrap:wrap; gap:5px 12px; align-items:center; justify-content:space-between; margin-bottom:7px; font-size:11.5px; color:var(--muted); }
+    .quota-details .warning { color:#fbbf24; }
+    .quota-details .ended { color:#f87171; font-weight:600; }
+    .input-row { display:flex; gap:9px; align-items:stretch; }
+    textarea { flex:1; min-width:0; min-height:62px; max-height:170px; resize:vertical; padding:12px 14px; font-size:13.5px; line-height:1.5; color:white; background:var(--surface); border:1px solid #475569; border-radius:12px; outline:none; }
+    textarea:focus { border-color:#60a5fa; }
+    .send { width:75px; min-width:75px; padding:0 8px; color:#052e16; background:var(--green); font-size:13px; font-weight:700; border:0; border-radius:11px; }
+    .send:not(:disabled):hover { background:#4ade80; }
+    .footer-note { color:#7b8ba2; font-size:10.5px; margin-top:7px; text-align:center; }
+    @media (max-width:750px) {
+      .sidebar { position:fixed; z-index:20; inset:0 auto 0 0; transform:translateX(-100%); transition:transform .2s; box-shadow:8px 0 28px #0005; }
+      .sidebar.open { transform:translateX(0); }
+      .mobile-sidebar { display:block; }
+      header { height:56px; min-height:56px; padding:0 12px; }
+      .title { font-size:13px; }
+      .sub-title { display:none; }
+      .quota-header { font-size:11px; }
+      .progress { width:90px; }
+      #chat { padding:18px 12px; }
+      .message.user { max-width:89%; }
+      .message.assistant { max-width:100%; }
+      .bottom { padding:0 12px 12px; }
+      textarea { min-height:58px; }
+      .send { width:62px; min-width:62px; }
+    }
+@media (prefers-reduced-motion:reduce) { *,*::before,*::after { transition:none !important; } }
+  </style>
+</head>
+<body>
+<div class="app">
+  <aside id="sidebar" class="sidebar" aria-label="Danh sách phiên chat">
+    <div class="sidebar-head"><button id="newChat" class="new-chat" type="button">＋ Phiên chat mới</button></div>
+    <div id="sessions" class="sessions"></div>
+  </aside>
+  <main class="main">
+    <header>
+      <div class="heading">
+        <button id="mobileSidebar" type="button" class="mobile-sidebar" aria-label="Mở danh sách phiên">☰</button>
+        <div>
+          <div class="title">DeepSeek R1 Distill Qwen 32B</div>
+          <div class="sub-title">Cloudflare Workers AI</div>
+        </div>
+      </div>
+      <div class="quota-header">
+        <div><strong id="tokenCounter">0 / 2.000</strong> token</div>
+        <div class="progress"><div id="quotaBar"></div></div>
+      </div>
+    </header>
+    <div id="chat" role="log" aria-live="polite"></div>
+    <div class="bottom">
+      <div class="quota-details">
+        <span id="status">Còn 2.000 token</span>
+        <span id="tokenBreakdown">Input: 0 · Output: 0 · Không tính reasoning</span>
+      </div>
+      <div class="input-row">
+        <textarea id="input" placeholder="Nhập câu hỏi…" aria-label="Câu hỏi"></textarea>
+        <button id="send" class="send" type="button">Gửi ↗</button>
+      </div>
+      <div class="footer-note">2.000 token ước tính / phiên · Đa phiên đồng thời · Streaming + Markdown · Enter gửi, Shift + Enter xuống dòng</div>
+    </div>
+  </main>
+</div>
+<script>
+window.addEventListener("DOMContentLoaded", () => {
+const SESSION_LIMIT = 20000;
+// Keep existing localStorage key, preserving previous sessions across upgrades.
+const STORAGE_KEY = "deepseek_multi_session_v3";
+const $ = id => document.getElementById(id);
+const chat = $("chat"), input = $("input"), sendButton = $("send");
+const sessionsElement = $("sessions"), tokenCounter = $("tokenCounter");
+const tokenBreakdown = $("tokenBreakdown"), quotaBar = $("quotaBar");
+const statusElement = $("status"), sidebar = $("sidebar");
+// Each chat owns its request and streaming draft; requests can run simultaneously.
+const pending = new Map(); // sessionId -> { draft, status }
+const notices = new Map(); // sessionId -> transient success/error notice
+let renderQueued = false;
+
+function estimateTokens(text = "") { return Math.ceil(String(text).length / 3.5); }
+function countTokens(messages) {
+  let input = 0, output = 0;
+  for (const m of messages || []) {
+    if (m.role === "user") input += estimateTokens(m.content);
+    if (m.role === "assistant") output += estimateTokens(m.content);
+  }
+  return { input, output, total: input + output };
+}
+function createSession() {
+  const now = Date.now();
+  return { id: crypto.randomUUID(), title: "Phiên chat mới", messages: [], draft: "", usedTokens: 0, createdAt: now, updatedAt: now };
+}
+function createInitialStore() {
+const session = createSession();
+  return { activeSessionId: session.id, sessions: [session] };
+}
+function loadStore() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY));
+    if (!parsed || !Array.isArray(parsed.sessions)) return createInitialStore();
+    parsed.sessions = parsed.sessions.filter(s => s && Array.isArray(s.messages) && typeof s.id === "string");
+    for (const s of parsed.sessions) {
+      s.usedTokens = countTokens(s.messages).total;
+      if (typeof s.draft !== "string") s.draft = "";
+    }
+    if (!parsed.sessions.length) return createInitialStore();
+    if (!parsed.sessions.some(s => s.id === parsed.activeSessionId)) parsed.activeSessionId = parsed.sessions[0].id;
+    return parsed;
+  } catch { return createInitialStore(); }
+}
+let store = loadStore();
+function saveStore() { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(store)); } catch {} }
+function activeSession() { return store.sessions.find(s => s.id === store.activeSessionId); }
+function createTitle(text) { const t = text.replace(/\\s+/g, " ").trim(); return t.length > 35 ? t.slice(0, 35) + "…" : t; }
+function formatNum(n) { return Number(n).toLocaleString("vi-VN"); }
+
+// Never call marked.parse -> innerHTML without DOMPurify.
+function renderMarkdown(div, source) {
+  div.classList.add("markdown");
+  if (!window.marked?.parse || !window.DOMPurify?.sanitize) {
+    div.textContent = source;
+    return;
+  }
+  try {
+    const unsafeHtml = window.marked.parse(source, { gfm: true, breaks: true });
+    const safeHtml = window.DOMPurify.sanitize(unsafeHtml, {
+      USE_PROFILES: { html: true },
+      FORBID_TAGS: ["img", "iframe", "svg", "math", "style", "video", "audio", "form"],
+      FORBID_ATTR: ["style"],
+      ALLOW_DATA_ATTR: false
+    });
+    div.innerHTML = safeHtml;
+    // Keep untrusted links from gaining access to the opener page.
+    for (const a of div.querySelectorAll("a")) {
+      const href = a.getAttribute("href") || "";
+      if (!/^(https?:|mailto:)/i.test(href)) a.removeAttribute("href");
+      a.rel = "noopener noreferrer nofollow";
+      a.target = "_blank";
+    }
+    for (const table of [...div.querySelectorAll("table")]) {
+      const wrapper = document.createElement("div");
+      wrapper.className = "table-scroll";
+      table.parentNode.insertBefore(wrapper, table);
+      wrapper.appendChild(table);
+    }
+  } catch {
+    div.textContent = source;
+  }
+}
+function renderSessions() {
+  sessionsElement.replaceChildren();
+  const sorted = [...store.sessions].sort((a,b) => (b.updatedAt || b.createdAt) - (a.updatedAt || a.createdAt));
+  for (const s of sorted) {
+    const item = document.createElement("div");
+    item.className = "session-item" + (s.id === store.activeSessionId ? " active" : "");
+    item.tabIndex = 0;
+    item.setAttribute("role", "button");
+    item.setAttribute("aria-label", "Mở " + (s.title || "phiên chat"));
+    const content = document.createElement("div");
+content.className = "session-content";
+    const title = document.createElement("div");
+    title.className = "session-title";
+    title.textContent = s.title || "Phiên chat";
+    const token = document.createElement("div");
+    token.className = "session-token";
+    const task = pending.get(s.id);
+    const draftTokens = task ? estimateTokens(task.draft) : 0;
+    token.textContent = formatNum(countTokens(s.messages).total + draftTokens) + " / " + formatNum(SESSION_LIMIT) + " token" + (task ? " · ● Đang trả lời" : "");
+    if (task) token.classList.add("running");
+    content.append(title, token);
+    const del = document.createElement("button");
+    del.className = "delete-session";
+    del.type = "button";
+    del.textContent = "✕";
+    del.title = "Xóa phiên";
+    del.setAttribute("aria-label", "Xóa phiên");
+    del.onclick = e => { e.stopPropagation(); deleteSession(s.id); };
+    item.onclick = () => switchSession(s.id);
+    item.onkeydown = e => { if (e.target === item && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); switchSession(s.id); } };
+    item.append(content, del);
+    sessionsElement.appendChild(item);
+  }
+}
+function addMessage(role, content, extra = "") {
+  const div = document.createElement("div");
+  div.className = "message " + (role === "user" ? "user" : "assistant") + (extra ? " " + extra : "");
+  if (role === "assistant" && !extra.includes("error")) renderMarkdown(div, content);
+  else div.textContent = content;
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+  return div;
+}
+function addNotice(text) {
+  const div = document.createElement("div");
+  div.className = "notice";
+  div.textContent = text;
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+}
+function renderChat() {
+  chat.replaceChildren();
+  const s = activeSession();
+  if (!s) return;
+  if (!s.messages.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    // Fixed static HTML (no external content).
+    empty.innerHTML = '<div class="empty-symbol">✦</div><div class="empty-title">DeepSeek Chat</div><div class="empty-hint">Mỗi phiên có 2.000 token cho input + output, không cộng reasoning.</div>';
+    chat.appendChild(empty);
+  } else {
+    for (const m of s.messages) addMessage(m.role, m.content);
+    const task = pending.get(s.id);
+    if (task) {
+      addMessage("assistant", task.draft || task.status || "Đang suy luận…", "streaming").id = "streamingMessage";
+    }
+  }
+  if (notices.has(s.id)) addNotice(notices.get(s.id));
+  updateStatus();
+}
+function updateStatus() {
+  const s = activeSession();
+  if (!s) return;
+  const counts = countTokens(s.messages);
+  const task = pending.get(s.id);
+  const displayOutput = counts.output + (task ? estimateTokens(task.draft) : 0);
+  const displayTotal = counts.input + displayOutput;
+  const remaining = Math.max(0, SESSION_LIMIT - displayTotal);
+tokenCounter.textContent = formatNum(Math.min(displayTotal, SESSION_LIMIT)) + " / " + formatNum(SESSION_LIMIT);
+  tokenBreakdown.textContent = "Input: " + formatNum(counts.input) + " · Output: " + formatNum(displayOutput) + " · Không tính reasoning";
+  quotaBar.style.width = Math.min(100, displayTotal * 100 / SESSION_LIMIT) + "%";
+  quotaBar.className = displayTotal >= SESSION_LIMIT ? "ended" : remaining <= 300 ? "warning" : "";
+  const ended = counts.total >= SESSION_LIMIT;
+  // Lock ONLY the chat whose own request is currently running.
+  input.disabled = Boolean(task) || ended;
+  sendButton.disabled = Boolean(task) || ended;
+  if (task) {
+    statusElement.className = "";
+    statusElement.textContent = task.draft ? "Đang nhận câu trả lời…" : (task.status || "Đang suy luận…");
+  } else if (ended) {
+    statusElement.className = "ended";
+    statusElement.textContent = "Đã hết 2.000 token. Tạo phiên mới để tiếp tục.";
+  } else if (remaining <= 300) {
+    statusElement.className = "warning";
+    statusElement.textContent = "Sắp hết phiên: còn khoảng " + formatNum(remaining) + " token.";
+  } else {
+    statusElement.className = "";
+    statusElement.textContent = "Còn khoảng " + formatNum(remaining) + " token.";
+  }
+}
+function queueDraftRender() {
+  if (renderQueued) return;
+  renderQueued = true;
+  requestAnimationFrame(() => {
+    renderQueued = false;
+    const task = pending.get(store.activeSessionId);
+    const node = $("streamingMessage");
+    if (task && node) {
+      renderMarkdown(node, task.draft || task.status || "Đang suy luận…");
+      chat.scrollTop = chat.scrollHeight;
+    }
+    updateStatus();
+    // Refresh sidebar only at a moderate rate; never re-render its DOM on each token.
+  });
+}
+function saveActiveDraft() {
+  const s = activeSession();
+  if (s && !pending.has(s.id)) s.draft = input.value;
+}
+function restoreActiveDraft() {
+  input.value = activeSession()?.draft || "";
+}
+function createNewSession() {
+  saveActiveDraft();
+  const s = createSession();
+  store.sessions.unshift(s);
+  store.activeSessionId = s.id;
+  saveStore(); restoreActiveDraft(); renderSessions(); renderChat();
+  sidebar.classList.remove("open");
+  input.focus();
+}
+function switchSession(id) {
+  if (!store.sessions.some(s => s.id === id)) return;
+  saveActiveDraft();
+  store.activeSessionId = id;
+  saveStore(); restoreActiveDraft(); renderSessions(); renderChat();
+  sidebar.classList.remove("open");
+  if (!pending.has(id)) input.focus();
+}
+function deleteSession(id) {
+  if (pending.has(id)) { alert("Phiên này đang nhận phản hồi. Hãy đợi trả lời xong trước khi xóa."); return; }
+  if (!confirm("Xóa phiên chat này?")) return;
+  const deletedActive = id === store.activeSessionId;
+  if (!deletedActive) saveActiveDraft();
+  store.sessions = store.sessions.filter(s => s.id !== id);
+  notices.delete(id);
+  if (!store.sessions.length) store.sessions = [createSession()];
+if (!store.sessions.some(s => s.id === store.activeSessionId)) store.activeSessionId = store.sessions[0].id;
+  saveStore(); restoreActiveDraft(); renderSessions(); renderChat();
+}
+
+// The client uses fetch + ReadableStream so it can POST JSON and handle SSE.
+// EventSource cannot send a POST body.
+async function readAppStream(body, onEvent) {
+  if (!body?.getReader) throw new Error("Trình duyệt không hỗ trợ streaming cho phản hồi này.");
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+      while (true) {
+        const sep = /\\r?\\n\\r?\\n/.exec(buffer);
+        if (!sep) break;
+        const rawFrame = buffer.slice(0, sep.index);
+        buffer = buffer.slice(sep.index + sep[0].length);
+        const lines = rawFrame.split(/\\r?\\n/);
+        let type = "message";
+        const dataLines = [];
+        for (const line of lines) {
+          if (line.startsWith("event:")) type = line.slice(6).trim();
+          else if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+        }
+        if (dataLines.length) {
+          try { onEvent(type, JSON.parse(dataLines.join("\\n"))); }
+          catch (e) { if (e.name !== "SyntaxError") throw e; }
+        }
+      }
+      if (done) return;
+    }
+  } finally { reader.releaseLock(); }
+}
+
+async function sendMessage() {
+  const text = input.value.trim();
+  const s = activeSession();
+  if (!text || !s || pending.has(s.id)) return;
+  const spent = countTokens(s.messages).total;
+  if (spent + estimateTokens(text) >= SESSION_LIMIT) {
+    notices.set(s.id, "Câu hỏi quá dài so với quota còn lại. Hãy nhập ngắn hơn hoặc tạo phiên mới.");
+    renderChat();
+    return;
+  }
+  if (!s.messages.length) s.title = createTitle(text);
+  s.messages.push({ role: "user", content: text });
+  s.draft = "";
+  s.updatedAt = Date.now();
+  const task = { draft: "", status: "Đang suy luận…" };
+  pending.set(s.id, task);
+  notices.delete(s.id);
+  input.value = "";
+  saveStore(); renderSessions(); renderChat();
+  let warning = null;
+  let doneData = null;
+  try {
+    // Snapshot the conversation belonging to THIS session. Another session can
+    // start its own fetch while we await network and streaming responses.
+    const messages = s.messages.map(m => ({ role: m.role, content: m.content }));
+    const response = await fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Accept": "text/event-stream" },
+      body: JSON.stringify({ messages })
+    });
+    if (!response.ok) {
+      let err = {};
+      try { err = await response.json(); } catch {}
+      throw new Error(err.error || "Workers AI không thể xử lý yêu cầu.");
+    }
+    await readAppStream(response.body, (type, data) => {
+      if (type === "delta") {
+task.draft += data.text || "";
+        if (store.activeSessionId === s.id) queueDraftRender();
+      } else if (type === "status") {
+        task.status = data.text || "Đang suy luận…";
+        if (store.activeSessionId === s.id) queueDraftRender();
+      } else if (type === "done") {
+        doneData = data;
+      } else if (type === "error") {
+        throw new Error(data.error || "Streaming bị gián đoạn.");
+      }
+    });
+    if (!doneData) throw new Error("Kết nối kết thúc mà không có sự kiện hoàn tất.");
+    const finalAnswer = String(doneData.answer || "");
+    if (finalAnswer) s.messages.push({ role: "assistant", content: finalAnswer });
+    s.usedTokens = countTokens(s.messages).total;
+    s.updatedAt = Date.now();
+    warning = doneData.warning || (doneData.limitReached ? "Đã hết quota của phiên." : null);
+  } catch (error) {
+    // Retry is kept in THIS session, not the currently viewed one.
+    const last = s.messages.at(-1);
+    if (last && last.role === "user" && last.content === text) s.messages.pop();
+    s.usedTokens = countTokens(s.messages).total;
+    s.draft = text;
+    warning = "Lỗi: " + error.message;
+  } finally {
+    pending.delete(s.id);
+    if (warning) notices.set(s.id, warning);
+    else notices.delete(s.id);
+    saveStore(); renderSessions();
+    if (store.activeSessionId === s.id) {
+      restoreActiveDraft();
+      renderChat();
+      if (!warning) input.focus();
+    } else {
+      updateStatus();
+    }
+  }
+}
+$("send").addEventListener("click", sendMessage);
+input.addEventListener("input", () => {
+  const s = activeSession();
+  if (s && !pending.has(s.id)) { s.draft = input.value; saveStore(); }
+});
+input.addEventListener("keydown", e => {
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+    e.preventDefault(); sendMessage();
+  }
+});
+$("newChat").addEventListener("click", createNewSession);
+$("mobileSidebar").addEventListener("click", () => sidebar.classList.toggle("open"));
+saveStore(); restoreActiveDraft(); renderSessions(); renderChat();
+
+});
+</script>
+</body>
+</html>`;
